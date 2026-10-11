@@ -1,0 +1,5 @@
+# Datos y salidas que generan los scripts de la entrega al correrse: no se
+# versionan.
+datasets/
+exp/
+*.log
