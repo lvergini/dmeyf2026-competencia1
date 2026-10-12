@@ -30,7 +30,7 @@ library(data.table)
 construir_FE026 <- function(archivo = file.path("datasets", "competencia_01.csv.gz")) {
 
   avance <- function(...) message(format(Sys.time(), "%H:%M:%S"), " [FE026] ", ...)
-  if (!file.exists(archivo)) stop("No existe ", archivo, " (¿bucket desconectado?)")
+  if (!file.exists(archivo)) stop("No existe ", archivo, ": copiar competencia_01.csv.gz en datasets/")
 
   avance("Leyendo ", archivo)
   d <- fread(archivo)

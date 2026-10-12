@@ -1,0 +1,379 @@
+---
+title: "Experimento `r params$experimento`"
+output:
+  github_document:
+    html_preview: false
+params:
+  experimento: "E001"
+  descripcion: "Baseline z495 evaluado con cinco semillas"
+  dataset: "competencia_01.csv.gz"
+  meses_train: !r c(202103, 202104)
+  meses_baja1: !r c(202105)
+  mes_future: 202106
+  campos_excluidos: !r c("cprestamos_personales", "mprestamos_personales")
+  campos_incluidos: !r character(0)
+  clase: "binaria2"
+  rf_arboles: 0
+  rf_hojas: 16
+  rf_min_data: 500
+  intrusos: 0
+  intrusos_metodo: "fraccion"
+  intrusos_umbral: 0.5
+  etiquetas: ""
+  hiperparametros: "exp/02_baseline_z495/BO_log.txt"
+  semillas: !r c(173207, 291419, 438203, 672439, 931123)
+  cortes: !r seq(9000, 15000, by = 500)
+  undersampling: 1.0
+  num_threads: !r NA
+---
+
+Plantilla de experimento. Entrena un modelo final por cada semilla, con hiperparámetros fijos, y mide la ganancia sobre el mes futuro. La configuración se define en los parámetros del encabezado; cada experimento se ejecuta con su propio script en `corridas/`, que fija esos parámetros mediante `correr_experimento()` y guarda este reporte y su resultado en `exp/<experimento>/`.
+
+La evaluación con varias semillas permite separar el efecto de un cambio del ruido propio del entrenamiento: una diferencia entre experimentos solo es informativa si es grande en relación con el desvío entre semillas.
+
+Descripción: `r params$descripcion`
+
+```{r setup, message = FALSE}
+library(data.table)
+library(here)
+library(lightgbm)
+
+source(here("R", "utils.R"))
+source(here("R", "modelo.R"))
+source(here("R", "evaluar_semillas_guardando.R"))
+source(here("R", "experimentos.R"))
+
+carpeta_exp <- here("exp", params$experimento)
+dir.create(carpeta_exp, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Configuración
+
+```{r configuracion}
+str(params)
+```
+
+## Hiperparámetros
+
+Se toma la fila de mayor métrica del log de la Optimización Bayesiana indicado. Cada fila del log contiene la lista completa de parámetros de LightGBM usada en esa iteración (parámetros fijos y optimizados), por lo que se reutiliza tal cual, descartando solo las columnas de registro y reemplazando la semilla en cada modelo.
+
+```{r hiperparametros}
+tb_bo <- fread(here(params$hiperparametros))
+setorder(tb_bo, -metrica)
+
+param <- as.list(tb_bo[1])
+param[c("fecha", "iter", "metrica")] <- NULL
+
+# cantidad de hilos de LightGBM: si no se indica, se usan todos los disponibles
+if (!is.na(params$num_threads)) param$num_threads <- params$num_threads
+
+param[c("learning_rate", "feature_fraction", "min_data_in_leaf",
+        "num_iterations", "num_leaves", "min_sum_hessian_in_leaf")]
+```
+
+## Datos
+
+```{r datos}
+dataset <- fread(here("datasets", params$dataset), stringsAsFactors = TRUE)
+
+# clase de entrenamiento (target engineering):
+#   binaria2: 1 = {BAJA+1, BAJA+2}, 0 = {CONTINUA}
+#   baja2:    1 = {BAJA+2},         0 = {BAJA+1, CONTINUA}
+#   ganadora: 1 = {BAJA+2},         0 = {CONTINUA}; los BAJA+1 no se usan
+# la ganancia siempre se mide con la clase_ternaria (BAJA+2)
+stopifnot(params$clase %in% c("binaria2", "baja2", "ganadora"))
+if (params$clase == "binaria2") {
+  dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+} else {
+  dataset[, clase01 := ifelse(clase_ternaria %in% "BAJA+2", 1L, 0L)]
+}
+
+# meses de entrenamiento completos, más los BAJA+1 de los meses cuya clase
+# solo se conoce parcialmente (en el juego de desarrollo, 202105: sus BAJA+2
+# y CONTINUA requerirían conocer 202107)
+dataset_train <- dataset[foto_mes %in% params$meses_train |
+                           (foto_mes %in% params$meses_baja1 &
+                              clase_ternaria == "BAJA+1")]
+dataset_future <- dataset[foto_mes == params$mes_future]
+
+if (params$clase == "ganadora") {
+  dataset_train <- dataset_train[clase_ternaria != "BAJA+1"]
+}
+
+# meses con clase artificial (pseudoetiquetado): sus registros se
+# agregan al entrenamiento con la probabilidad del etiquetador como clase
+# (etiqueta suave, objetivo cross_entropy de LightGBM); la clase real de esos
+# meses no interviene
+if (nchar(params$etiquetas) > 0) {
+  stopifnot(params$intrusos == 0, params$clase == "binaria2")
+  etiquetas <- fread(here(params$etiquetas))
+  artificiales <- dataset[etiquetas, on = c("numero_de_cliente", "foto_mes"), nomatch = 0L]
+  stopifnot(nrow(artificiales) == nrow(etiquetas),
+            !any(artificiales$foto_mes %in% dataset_train$foto_mes))
+  artificiales[, clase01 := prob]
+  artificiales[, prob := NULL]
+  artificiales[, clase_ternaria := NA]
+  dataset_train[, clase01 := as.numeric(clase01)]
+  dataset_train <- rbindlist(list(dataset_train, artificiales), use.names = TRUE)
+  param$objective <- "cross_entropy"
+  print(artificiales[, .(registros = .N, clase_media = mean(clase01)), by = foto_mes])
+  rm(etiquetas, artificiales)
+}
+
+campos_buenos <- setdiff(
+  colnames(dataset),
+  c("clase_ternaria", "clase01", params$campos_excluidos)
+)
+
+# si se indica una lista de variables, se usan solo esas
+if (length(params$campos_incluidos) > 0) {
+  faltantes <- setdiff(params$campos_incluidos, colnames(dataset))
+  if (length(faltantes) > 0) stop("Variables inexistentes: ", paste(faltantes, collapse = ", "))
+  campos_buenos <- params$campos_incluidos
+}
+
+# eliminación de registros intrusos: CONTINUA que un modelo que
+# no los vio considera muy probables bajas. Los registros de entrenamiento se
+# parten en dos mitades por cliente; se entrena en una mitad y se predice la
+# otra, y al revés; se quita la fracción params$intrusos de los CONTINUA con
+# mayor probabilidad
+intrusos_info <- NULL
+if (params$intrusos_metodo == "denicolay") {
+  # método "denicolay": modelo
+  # auxiliar entrenado en el 30 % (por registro, estratificado por
+  # clase_ternaria, undersampling 0,1, hiperparámetros fijos); se quitan del
+  # 70 % los CONTINUA con probabilidad mayor al umbral. El 30 % se conserva
+  # sin limpiar
+  particionar(dataset_train, division = c(70, 30), agrupa = "clase_ternaria",
+              seed = params$semillas[1])
+  set.seed(params$semillas[1], kind = "L'Ecuyer-CMRG")
+  azar_aux <- runif(nrow(dataset_train))
+  entrena30 <- dataset_train$fold == 2L & (azar_aux <= 0.1 | dataset_train$clase01 == 1L)
+  modelo_aux <- lgb.train(
+    data = lgb.Dataset(data.matrix(dataset_train[entrena30, campos_buenos, with = FALSE]),
+                       label = dataset_train$clase01[entrena30]),
+    param = modifyList(param, list(seed = params$semillas[1], num_iterations = 2180L,
+                                   num_leaves = 30L, min_sum_hessian_in_leaf = 0.1141634103))
+  )
+  en70 <- which(dataset_train$fold == 1L)
+  prob30 <- predict(modelo_aux, data.matrix(dataset_train[en70, campos_buenos, with = FALSE]))
+  rm(modelo_aux)
+  gc(verbose = FALSE)
+  es_continua <- dataset_train$clase_ternaria[en70] == "CONTINUA"
+  quitar <- en70[es_continua & prob30 > params$intrusos_umbral]
+  intrusos_info <- data.table(
+    metodo = "denicolay", umbral = params$intrusos_umbral,
+    continua = sum(es_continua), quitados = length(quitar),
+    fraccion = length(quitar) / sum(es_continua),
+    prob_media_bajas = mean(prob30[dataset_train$clase01[en70] == 1L])
+  )
+  # para descartar también el 30 %: dataset_train <- dataset_train[setdiff(en70, quitar)]
+  dataset_train <- dataset_train[-quitar]
+  dataset_train[, fold := NULL]
+  fwrite(intrusos_info, file.path(carpeta_exp, "intrusos.csv"))
+  print(intrusos_info)
+} else if (params$intrusos > 0) {
+  particionar_por_cliente(dataset_train, division = c(1, 1),
+                          seed = params$semillas[1], campo = "mitad")
+  prob_oof <- rep(NA_real_, nrow(dataset_train))
+  for (m in 1:2) {
+    entrena <- dataset_train$mitad != m
+    modelo_i <- lgb.train(
+      data = lgb.Dataset(data.matrix(dataset_train[entrena, campos_buenos, with = FALSE]),
+                         label = dataset_train$clase01[entrena]),
+      param = modifyList(param, list(seed = params$semillas[1]))
+    )
+    prob_oof[!entrena] <- predict(modelo_i,
+                                  data.matrix(dataset_train[!entrena, campos_buenos, with = FALSE]))
+    rm(modelo_i)
+    gc(verbose = FALSE)
+  }
+  continua <- which(dataset_train$clase_ternaria == "CONTINUA")
+  n_quitar <- round(params$intrusos * length(continua))
+  quitar <- continua[order(-prob_oof[continua])][seq_len(n_quitar)]
+  intrusos_info <- data.table(
+    continua = length(continua), fraccion = params$intrusos, quitados = n_quitar,
+    prob_minima_quitada = min(prob_oof[quitar]),
+    prob_media_bajas = mean(prob_oof[dataset_train$clase01 == 1L])
+  )
+  dataset_train <- dataset_train[-quitar]
+  dataset_train[, mitad := NULL]
+  fwrite(intrusos_info, file.path(carpeta_exp, "intrusos.csv"))
+  print(intrusos_info)
+}
+
+# hojas de Random Forest como variables (feature engineering disruptivo):
+# un bosque de LightGBM en modo random forest, entrenado solo con
+# los datos de entrenamiento; cada árbol aporta una variable con la hoja en
+# la que cae cada registro
+if (params$rf_arboles > 0) {
+  param_rf <- list(
+    objective = "binary", boosting = "rf",
+    num_iterations = params$rf_arboles, num_leaves = params$rf_hojas,
+    min_data_in_leaf = params$rf_min_data,
+    feature_fraction = 0.5, bagging_fraction = 0.632, bagging_freq = 1,
+    max_bin = 31L, feature_pre_filter = FALSE, verbosity = -1,
+    seed = params$semillas[1],
+    num_threads = if (is.na(params$num_threads)) 0L else params$num_threads
+  )
+  x_rf_train <- data.matrix(dataset_train[, campos_buenos, with = FALSE])
+  modelo_rf <- lgb.train(data = lgb.Dataset(x_rf_train, label = dataset_train$clase01),
+                         params = param_rf)
+  hojas_train <- predict(modelo_rf, x_rf_train, type = "leaf")
+  hojas_future <- predict(modelo_rf, data.matrix(dataset_future[, campos_buenos, with = FALSE]),
+                          type = "leaf")
+  nombres_hojas <- paste0("rf_hoja_", seq_len(ncol(hojas_train)))
+  dataset_train[, (nombres_hojas) := as.data.table(hojas_train)]
+  dataset_future[, (nombres_hojas) := as.data.table(hojas_future)]
+  campos_buenos <- c(campos_buenos, nombres_hojas)
+  rm(x_rf_train, modelo_rf, hojas_train, hojas_future)
+}
+
+dataset_train[, .N, by = .(foto_mes, clase_ternaria)][order(foto_mes, clase_ternaria)]
+length(campos_buenos)
+```
+
+## Entrenamiento y evaluación
+
+```{r evaluacion}
+t0 <- Sys.time()
+
+resultado <- evaluar_semillas_guardando(
+  dataset_train = dataset_train,
+  campos = campos_buenos,
+  x_future = data.matrix(dataset_future[, campos_buenos, with = FALSE]),
+  clase_future = dataset_future$clase_ternaria,
+  param = param,
+  semillas = params$semillas,
+  undersampling = params$undersampling,
+  carpeta = file.path(carpeta_exp, "semillas")
+)
+curvas <- resultado$curvas
+
+# probabilidades de cada cliente del mes futuro, por semilla y promedio,
+# para ensambles y análisis posteriores
+tb_prob <- data.table(numero_de_cliente = dataset_future$numero_de_cliente,
+                      clase_ternaria = as.character(dataset_future$clase_ternaria),
+                      resultado$probabilidades)
+tb_prob[, prob_media := rowMeans(resultado$probabilidades)]
+fwrite(tb_prob, file.path(carpeta_exp, "probabilidades_future.csv.gz"))
+
+# importancia de variables (ganancia, cobertura y frecuencia) de cada modelo,
+# y resumen promedio entre semillas; una variable que un modelo no usa cuenta
+# como 0 en ese modelo
+fwrite(resultado$importancia, file.path(carpeta_exp, "importancia_por_semilla.csv"))
+imp_resumen <- resultado$importancia[, list(gain = sum(Gain) / uniqueN(resultado$importancia$semilla),
+                                            modelos_que_la_usan = .N), by = Feature]
+setnames(imp_resumen, "Feature", "variable")
+setorder(imp_resumen, -gain)
+imp_resumen[, posicion := .I]
+fwrite(imp_resumen, file.path(carpeta_exp, "importancia.csv"))
+
+minutos <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+round(minutos, 1)
+```
+
+## Resultados
+
+Ganancia por cantidad de envíos, resumida entre semillas.
+
+```{r resumen}
+tb_cortes <- resumir_cortes(curvas, params$cortes)
+fwrite(tb_cortes, file.path(carpeta_exp, "ganancia_cortes.txt"), sep = "\t")
+
+knitr::kable(tb_cortes, format.args = list(big.mark = "."), digits = 0)
+```
+
+Ganancia del semillerío: el modelo que se entrega promedia las probabilidades de todas las semillas, por lo que su ganancia es la de una única curva calculada con la probabilidad promedio. Se informa junto con la ganancia media de las semillas por separado, que es la que permite estimar la variabilidad.
+
+```{r semillerio}
+curva_sem <- curva_ganancia(tb_prob$prob_media, tb_prob$clase_ternaria)
+curva_sem[, semilla := 0]
+tb_sem <- resumir_cortes(curva_sem, params$cortes)[, list(envios, ganancia = ganancia_media)]
+fwrite(tb_sem, file.path(carpeta_exp, "ganancia_semillerio.txt"), sep = "\t")
+
+semillerio <- list(
+  maximo = max(tb_sem$ganancia),
+  envios = tb_sem[which.max(ganancia), envios],
+  zona = tb_sem[envios >= 10000 & envios <= 12500, mean(ganancia)]
+)
+knitr::kable(tb_sem, format.args = list(big.mark = "."), digits = 0)
+unlist(semillerio)
+```
+
+El corte se elige sobre la ganancia media entre semillas y no sobre el máximo de una semilla particular, para no sobreestimar la ganancia por azar.
+
+```{r corte_optimo}
+mejor <- tb_cortes[which.max(ganancia_media)]
+mejor
+```
+
+Curvas de ganancia acumulada por semilla (gris) y curva media (negro).
+
+```{r curvas, fig.width = 8, fig.height = 4.5}
+rango <- curvas[pos >= 5000 & pos <= 20000]
+curva_media <- rango[, list(ganancia = mean(ganancia_acumulada)), by = pos]
+
+plot(NULL,
+     xlim = range(rango$pos),
+     ylim = range(rango$ganancia_acumulada) / 1e6,
+     xlab = "Cantidad de envíos", ylab = "Ganancia acumulada (millones)",
+     main = paste("Ganancia en", params$mes_future))
+for (s in params$semillas) {
+  lines(rango[semilla == s, pos], rango[semilla == s, ganancia_acumulada] / 1e6,
+        col = "grey70")
+}
+lines(curva_media$pos, curva_media$ganancia / 1e6, lwd = 2)
+abline(v = mejor$envios, lty = 2)
+```
+
+## Importancia de variables
+
+Treinta variables más importantes, promedio entre semillas (tabla completa en `importancia.csv`).
+
+```{r importancia_variables}
+knitr::kable(head(imp_resumen, 30), digits = 4)
+```
+
+## Registro
+
+El resultado se guarda en la carpeta del experimento. El registro general `experimentos.csv` se arma consolidando estos archivos con `consolidar_experimentos()`, de modo que experimentos corridos en máquinas distintas no escriben un archivo común.
+
+```{r registro}
+guardar_resultado(
+  carpeta_exp,
+  list(
+    experimento = params$experimento,
+    fecha = format(Sys.time(), "%Y-%m-%d %H:%M"),
+    maquina = Sys.info()[["nodename"]],
+    descripcion = params$descripcion,
+    dataset = params$dataset,
+    meses_train = paste(params$meses_train, collapse = "+"),
+    meses_baja1 = paste(params$meses_baja1, collapse = "+"),
+    mes_future = params$mes_future,
+    columnas = length(campos_buenos),
+    hiperparametros = params$hiperparametros,
+    semillas = length(params$semillas),
+    undersampling = params$undersampling,
+    clase = params$clase,
+    rf_arboles = params$rf_arboles,
+    intrusos = params$intrusos,
+    intrusos_metodo = params$intrusos_metodo,
+    etiquetas = params$etiquetas,
+    envios = mejor$envios,
+    ganancia_media = round(mejor$ganancia_media),
+    desvio = round(mejor$desvio),
+    zona_10000_12500 = round(tb_cortes[envios >= 10000 & envios <= 12500, mean(ganancia_media)]),
+    semillerio_maximo = round(semillerio$maximo),
+    semillerio_envios = semillerio$envios,
+    semillerio_zona = round(semillerio$zona),
+    minutos = round(minutos, 1)
+  )
+)
+```
+
+## Entorno de ejecución
+
+```{r sesion}
+sessionInfo()
+```

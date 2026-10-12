@@ -30,6 +30,7 @@ modelo_A_FE026_B018/
   semillas_A.csv          semillas que entran en la entrega
   BO_log_corrido.txt      log de la optimización que se usó
 02_prediccion_final.R     semillerío, corte y archivo final
+evaluacion_junio/         evaluación en 202106 con la que se eligió el corte (no interviene en el archivo final)
 ```
 
 ## Dataset FE026
@@ -52,7 +53,7 @@ FE026 tiene 763 columnas:
    hace comparables las variables entre meses y atenúa el efecto de la
    inflación.
 
-## Bayesiana frugal
+## Bayesiana
 
 Los hiperparámetros salen de una optimización bayesiana con pocas
 evaluaciones sobre un conjunto chico de hiperparámetros.
@@ -76,6 +77,26 @@ evaluaciones sobre un conjunto chico de hiperparámetros.
 
 Se usa la configuración de mayor AUC del log: evaluación 11, AUC 0,92064,
 2.786 árboles, 1.080 hojas y `min_sum_hessian_in_leaf` 0,0473.
+
+## Cómo se eligieron los hiperparámetros y el corte
+
+Todas las decisiones se tomaron con modelos entrenados con 202103 y 202104 y
+evaluados en 202106, un mes que no interviene en ese entrenamiento. 202105 no
+se usa, para reproducir el hueco de un mes que hay entre los datos de
+entrenamiento final y 202108.
+
+- **Hiperparámetros:** la optimización bayesiana descripta arriba entrena con
+  202103 y 202104 y mide el AUC en 202106.
+- **Corte:** el modelo, con esos hiperparámetros, se entrenó con 202103 y
+  202104 con 20 semillas, sin préstamos personales. Se calculó la ganancia en
+  202106 para cada cantidad de envíos (+1.072.500 por cada BAJA+2 y −27.500
+  por cada envío), tanto del semillerío como de cada semilla. Como la curva
+  es irregular (cada baja suma de golpe), se usó la curva suavizada: el
+  promedio de la ganancia en ±500 envíos alrededor de cada corte. El corte se
+  ubicó en el centro de la zona más alta de esa curva.
+
+El código de esta evaluación está en `evaluacion_junio/`. No interviene en la
+producción del archivo final.
 
 ## Requisitos
 
@@ -103,6 +124,30 @@ Se usa la configuración de mayor AUC del log: evaluación 11, AUC 0,92064,
   semilla ocupan poco.
 
 ## Orden de corrida
+
+`00_pipeline.R` ejecuta toda la entrega en orden, cada paso en un proceso de
+R aparte, y se detiene con un mensaje que indica qué paso falló; la salida de
+cada paso queda en `exp/registros/`. Por defecto usa el log de la
+optimización de la entrega (`BO_log_corrido.txt`) y corre las sublistas de
+la producción una después de otra. Con `--paralelo` corre las sublistas a la
+vez, cada una en su propio proceso, y con `--bayesiana` corre además la
+optimización completa:
+
+```bash
+Rscript 00_pipeline.R
+Rscript 00_pipeline.R --paralelo
+Rscript 00_pipeline.R --bayesiana
+```
+
+Casi todo el tiempo es de la producción: entre 24 y 27 minutos por semilla
+si las sublistas corren en secuencia; con `--paralelo`, el de la sublista
+más larga, siempre que la máquina tenga hilos y memoria para todas a la vez
+(cada sublista usa 8 hilos y carga el dataset completo). Para 100 semillas,
+son unas 40 horas en secuencia y unas 10 con `--paralelo` y cuatro
+sublistas, si cada sublista dispone de 8 hilos propios, como en la
+producción original, donde cada sublista corrió en una máquina de 8 vCPU.
+A eso se suman unos minutos de dataset y de predicción final, y entre 1 h
+15 min y 1 h 22 min con `--bayesiana`. Los pasos siguientes describen lo que hace cada etapa.
 
 Los tiempos son los medidos en las máquinas virtuales, a partir de los
 registros de las corridas. Donde solo hay una cota, se indica.
@@ -203,7 +248,7 @@ fecha y la hora de la corrida y nunca se sobrescribe.
 
 | Semillas en `semillas_A.csv` | Descartadas por predicciones idénticas | Usadas |
 |---|---|---|
-| COMPLETAR | COMPLETAR | COMPLETAR |
+| 107 (4 sublistas, 7 procesos) | 1 (694327, idéntica a 316817) | 106 |
 
 ## Verificación
 
